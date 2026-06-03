@@ -39,7 +39,7 @@ CONFIG_PATH: Path = PKG_DIR / "config.json"
 # 支持两种值：
 #   1) 单个 ROM 文件： Path(r"D:\roms\GBA\Pokemon.gba")
 #   2) 一个文件夹：    Path(r"D:\roms\GBA")  会按 SYSTEM 的扩展名过滤后逐个处理
-ROM_PATH: Path = Path(r"F:\test3\GBA")
+ROM_PATH: Path = Path(r"F:/RG556/gba/运动游戏")
 
 # 系统名（必须在 tiny_scraper/systems.py 中存在），常用值：
 #   GBA / GBC / GB / FC / SFC / MD / N64 / PS / PSP / NDS / SMS / GG / ...
@@ -49,7 +49,7 @@ SYSTEM: str = "GBA"
 OUT_DIR: Path = PROJECT_ROOT / "out"
 
 # scan 模式：ROM 根目录（其下应有 <SYSTEM>/ 子目录）
-ROMS_ROOT: Path = Path(r"F:\test3")
+ROMS_ROOT: Path = Path(r"F:/RG556/gba/运动游戏")
 
 # scan 模式：列出 / 下载的最大条数，0 表示不限
 LIMIT: int = 5
