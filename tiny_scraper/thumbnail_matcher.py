@@ -5,6 +5,8 @@ import os
 from pickle import FALSE
 import re
 import unicodedata
+import zipfile
+import zlib
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from html.parser import HTMLParser
@@ -14,7 +16,7 @@ from urllib.parse import quote, unquote
 from urllib.request import Request, urlopen
 
 ADDRESS = "https://thumbnails.libretro.com"
-DEF_SCORE = 90
+DEF_SCORE = 80
 MAX_SCORE = 100
 THUMB_DIRS = ["Named_Boxarts", "Named_Titles", "Named_Snaps", "Named_Logos"]
 
@@ -30,7 +32,8 @@ REQUEST_TIMEOUT = 15
 READ_CHUNK_SIZE = 64 * 1024
 MAX_DIRECTORY_BYTES = 20 * 1024 * 1024
 SHOW_PROGRESS = True
-THUMBNAIL_JSON_DIR = "thumbnail_json"
+THUMBNAIL_JSON_DIR = Path(__file__).parent / "libretro_data/mediadata"
+METADATA_JSON_DIR = Path(__file__).parent / "libretro_data/metadata"
 BUILD_ALL_PLATFORM_JSON = False
 BUILD_JSON_IF_SYSTEM_MISSING = True
 SKIP_EXISTING_PLATFORM_JSON = True
@@ -54,6 +57,15 @@ class Match:
     name: str
     score: float
     urls: dict[str, str]
+
+
+@dataclass(frozen=True)
+class GameMedia:
+    path: Path
+    crc: str
+    name: str | None
+    metadata: dict | None
+    media: list[Match]
 
 
 class LinkParser(HTMLParser):
@@ -358,7 +370,7 @@ def build_system_thumbnails_json(
     return thumbnail_index
 
 
-def build_all_system_thumbnail_json_files(
+def build_all_json(
     json_dir: str | Path = THUMBNAIL_JSON_DIR,
     *,
     address: str = ADDRESS,
@@ -391,7 +403,163 @@ def load_system_thumbnails_json(
         return json.load(file)
 
 
-def find_image_for_filename_from_json(
+def load_system_metadata_json(
+    system: str,
+    metadata_dir: str | Path = METADATA_JSON_DIR,
+) -> list[dict]:
+    with system_json_path(system, metadata_dir).open("r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def build_crc_metadata_map(metadata: list[dict]) -> dict[str, dict]:
+    result = {}
+    for item in metadata:
+        crc = item.get("crc")
+        if crc:
+            result[str(crc).upper()] = item
+    return result
+
+
+def file_crc32(path: str | Path) -> str:
+    crc = 0
+    with Path(path).open("rb") as file:
+        while chunk := file.read(READ_CHUNK_SIZE):
+            crc = zlib.crc32(chunk, crc)
+    return f"{crc & 0xFFFFFFFF:08X}"
+
+
+def zip_crc32(path: str | Path) -> str:
+    with zipfile.ZipFile(path) as archive:
+        for info in archive.infolist():
+            if not info.is_dir():
+                return f"{info.CRC & 0xFFFFFFFF:08X}"
+    raise ValueError(f"Zip has no file: {path}")
+
+
+def game_crc32(path: str | Path) -> str:
+    path = Path(path)
+    if path.suffix.lower() == ".zip":
+        return zip_crc32(path)
+    return file_crc32(path)
+
+
+def find_game_by_crc(
+    crc: str,
+    system: str,
+    metadata_dir: str | Path = METADATA_JSON_DIR,
+) -> dict | None:
+    metadata = load_system_metadata_json(system, metadata_dir)
+    return build_crc_metadata_map(metadata).get(crc.upper())
+
+
+def find_media_by_crc(
+    crc: str,
+    system: str,
+    metadata_dir: str | Path = METADATA_JSON_DIR,
+    json_dir: str | Path = THUMBNAIL_JSON_DIR,
+    *,
+    min_score: int = DEF_SCORE,
+    limit: int = 5,
+    no_meta: bool = False,
+    hack: bool = False,
+    before: str | None = None,
+) -> GameMedia | None:
+    metadata = find_game_by_crc(crc, system, metadata_dir)
+    if not metadata:
+        return None
+
+    name = metadata.get("name") or game_name_from_filename(metadata.get("rom_name", ""))
+    media = find_in_json(
+        name,
+        system,
+        json_dir,
+        min_score=min_score,
+        limit=limit,
+        no_meta=no_meta,
+        hack=hack,
+        before=before,
+    )
+    return GameMedia(path=Path(), crc=crc.upper(), name=name, metadata=metadata, media=media)
+
+
+def find_game_media(
+    path: str | Path,
+    system: str,
+    metadata_dir: str | Path = METADATA_JSON_DIR,
+    json_dir: str | Path = THUMBNAIL_JSON_DIR,
+    *,
+    min_score: int = DEF_SCORE,
+    limit: int = 5,
+    no_meta: bool = False,
+    hack: bool = False,
+    before: str | None = None,
+) -> GameMedia:
+    path = Path(path)
+    metadata_map = build_crc_metadata_map(load_system_metadata_json(system, metadata_dir))
+    thumbnail_index = load_system_thumbnails_json(system, json_dir)
+    crc = game_crc32(path)
+    metadata = metadata_map.get(crc)
+    name = None
+    media = []
+
+    if metadata:
+        name = metadata.get("name") or game_name_from_filename(metadata.get("rom_name", ""))
+        media = find_best_thumbnails(
+            name,
+            thumbnail_index,
+            min_score=min_score,
+            limit=limit,
+            no_meta=no_meta,
+            hack=hack,
+            before=before,
+        )
+
+    return GameMedia(path=path, crc=crc, name=name, metadata=metadata, media=media)
+
+
+def scan_game_media(
+    directory: str | Path,
+    system: str,
+    metadata_dir: str | Path = METADATA_JSON_DIR,
+    json_dir: str | Path = THUMBNAIL_JSON_DIR,
+    *,
+    recursive: bool = True,
+    extensions: set[str] | None = None,
+    min_score: int = DEF_SCORE,
+    limit: int = 5,
+    no_meta: bool = False,
+    hack: bool = False,
+    before: str | None = None,
+) -> list[GameMedia]:
+    directory = Path(directory)
+    files = directory.rglob("*") if recursive else directory.glob("*")
+    allowed_extensions = {ext.lower() for ext in extensions} if extensions else None
+    results = []
+
+    for path in files:
+        if not path.is_file():
+            continue
+        if allowed_extensions and path.suffix.lower() not in allowed_extensions:
+            continue
+
+        results.append(
+            find_game_media(
+                path,
+                system,
+                metadata_dir,
+                json_dir,
+                min_score=min_score,
+                limit=limit,
+                no_meta=no_meta,
+                hack=hack,
+                before=before,
+            )
+        )
+
+    return results
+
+
+def find_in_json(
     filename: str,
     system: str,
     json_dir: str | Path = THUMBNAIL_JSON_DIR,
@@ -414,7 +582,7 @@ def find_image_for_filename_from_json(
     )
 
 
-def find_image_for_filename_from_json_or_build(
+def find_or_build_json(
     filename: str,
     system: str,
     json_dir: str | Path = THUMBNAIL_JSON_DIR,
@@ -523,7 +691,7 @@ def find_image_for_filename(
 
 def run_example():
     if BUILD_ALL_PLATFORM_JSON:
-        systems = build_all_system_thumbnail_json_files(
+        systems = build_all_json(
             THUMBNAIL_JSON_DIR,
             address=ADDRESS,
             skip_existing=SKIP_EXISTING_PLATFORM_JSON,
@@ -531,7 +699,7 @@ def run_example():
         print(f"Checked {len(systems)} platform JSON files in {THUMBNAIL_JSON_DIR}")
 
     if BUILD_JSON_IF_SYSTEM_MISSING:
-        matches = find_image_for_filename_from_json_or_build(
+        matches = find_or_build_json(
             FILENAME,
             SYSTEM,
             THUMBNAIL_JSON_DIR,
@@ -543,7 +711,7 @@ def run_example():
             before=BEFORE,
         )
     else:
-        matches = find_image_for_filename_from_json(
+        matches = find_in_json(
             FILENAME,
             SYSTEM,
             THUMBNAIL_JSON_DIR,
@@ -564,8 +732,46 @@ def run_example():
             print(f"  {thumb_type}: {url}")
 
 
+def verify_scan_game_media():
+    rom_path = Path(r"F:\roms\gb")
+    system = "Nintendo - Game Boy"
+
+    if rom_path.is_file():
+        results = [
+            find_game_media(
+                rom_path,
+                system,
+                limit=1,
+                no_meta=True,
+            )
+        ]
+    else:
+        results = scan_game_media(
+            rom_path,
+            system,
+            extensions={".gb", ".zip"},
+            limit=1,
+            no_meta=True,
+        )
+
+    for item in results:
+        print(f"file: {item.path}")
+        print(f"crc: {item.crc}")
+        print(f"game: {item.name or '未匹配到 metadata'}")
+        if item.metadata:
+            print("metadata:")
+            print(json.dumps(item.metadata, ensure_ascii=False, indent=2))
+        if not item.media:
+            print("media: 未匹配到")
+        for match in item.media:
+            print(f"media: {match.name} ({match.score:.1f})")
+            for thumb_type, url in match.urls.items():
+                print(f"  {thumb_type}: {url}")
+        print()
+
+
 def main():
-    run_example()
+    verify_scan_game_media()
 
 
 if __name__ == "__main__":
